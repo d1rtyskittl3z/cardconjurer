@@ -5661,13 +5661,14 @@ async function downloadSavedCards() {
 		download.remove();
 	}
 }
-function uploadSavedCards(event) {
-	var reader = new FileReader();
-	reader.onload = function () {
-		JSON.parse(reader.result).forEach(item => saveCard(item));
-	}
-	reader.readAsText(event.target.files[0]);
-}
+// Function replaced with version so that Metadata loads correctly found at bottom --D1rtySkilttl3z
+// function uploadSavedCards(event) {
+// 	var reader = new FileReader();
+// 	reader.onload = function () {
+// 		JSON.parse(reader.result).forEach(item => saveCard(item));
+// 	}
+// 	reader.readAsText(event.target.files[0]);
+// }
 //TUTORIAL TAB
 function loadTutorialVideo() {
 	var video = document.querySelector('.video > iframe');
@@ -6046,3 +6047,450 @@ bindInputs('#show-guidelines', '#show-guidelines-2', true);
 loadScript('/js/frames/groupStandard-3.js');
 loadAvailableCards();
 initDraggableArt();
+
+// Adding functionality to download card with added metadata --D1rtySkittl3z
+
+// ---- Minimal PNG helpers (for iTXt injection) ----
+function _crc32(u8) {
+  let c = 0xffffffff >>> 0;
+  for (let i = 0; i < u8.length; i++) {
+    c ^= u8[i];
+    for (let k = 0; k < 8; k++) c = (c >>> 1) ^ (0xEDB88320 & -(c & 1));
+  }
+  return (c ^ 0xffffffff) >>> 0;
+}
+function _makeChunk(type, data) {
+  const t = new TextEncoder().encode(type);
+  const len = data.length;
+  const out = new Uint8Array(4 + 4 + len + 4);
+  new DataView(out.buffer).setUint32(0, len);
+  out.set(t, 4);
+  out.set(data, 8);
+  const crc = _crc32(out.subarray(4, 8 + len));
+  new DataView(out.buffer).setUint32(8 + len, crc);
+  return out;
+}
+function _makeITXt(keyword, utf8Text) {
+  const enc = new TextEncoder();
+  const nul = Uint8Array.of(0);
+  const parts = [
+    enc.encode(keyword), nul,     // keyword\0
+    Uint8Array.of(0),             // compression flag = 0 (uncompressed)
+    Uint8Array.of(0),             // compression method = 0
+    nul,                          // language tag ""
+    nul,                          // translated keyword ""
+    enc.encode(utf8Text)          // UTF-8 text
+  ];
+  const data = new Uint8Array(parts.reduce((n,p)=>n+p.length,0));
+  let off = 0; for (const p of parts) { data.set(p, off); off += p.length; }
+  return _makeChunk('iTXt', data);
+}
+function _insertBeforeIEND(png, chunk) {
+  const sig = png.subarray(0, 8);
+  let i = 8;
+  const keep = [];
+  while (i < png.length) {
+    const len = new DataView(png.buffer, png.byteOffset + i).getUint32(0);
+    const type = new TextDecoder('latin1').decode(png.subarray(i + 4, i + 8));
+    const clen = 12 + len; // len + type + data + crc
+    if (type === 'IEND') {
+      const out = new Uint8Array(sig.length + keep.reduce((n,c)=>n+c.length,0) + chunk.length + clen);
+      let o = 0;
+      out.set(sig, o); o += sig.length;
+      for (const c of keep) { out.set(c, o); o += c.length; }
+      out.set(chunk, o); o += chunk.length;
+      out.set(png.subarray(i, i + clen), o);
+      return out;
+    }
+    keep.push(png.subarray(i, i + clen));
+    i += clen;
+  }
+  throw new Error('Invalid PNG (IEND not found)');
+}
+
+// ---- Build a lean snapshot of the current card in memory ----
+function _snapshotCurrentCard() {
+  function _isSkippable(val) {
+    // primitive/null
+    if (val === null || typeof val !== 'object') return false;
+
+    // DOM nodes/elements
+    if (typeof Node !== 'undefined' && val instanceof Node) return true;
+
+    const ctor = val.constructor && val.constructor.name;
+    // Known un-serializable web types
+    const bad = new Set([
+      'HTMLImageElement', 'Image', 'ImageBitmap',
+      'HTMLCanvasElement', 'OffscreenCanvas',
+      'CanvasRenderingContext2D', 'CanvasGradient', 'CanvasPattern',
+      'FontFace', 'WebGLRenderingContext', 'WebGL2RenderingContext'
+    ]);
+    return bad.has(ctor);
+  }
+
+  function _clone(obj, seen = new WeakMap()) {
+    if (obj === null || typeof obj !== 'object') return obj;
+
+    if (seen.has(obj)) return seen.get(obj);
+
+    // Skip un-serializable things entirely
+    if (_isSkippable(obj)) return undefined;
+
+    if (Array.isArray(obj)) {
+      const arr = [];
+      seen.set(obj, arr);
+      for (const item of obj) {
+        if (typeof item === 'function' || _isSkippable(item)) continue;
+        const c = _clone(item, seen);
+        if (c !== undefined) arr.push(c);
+      }
+      return arr;
+    }
+
+    const out = {};
+    seen.set(obj, out);
+    for (const [k, v] of Object.entries(obj)) {
+      if (typeof v === 'function' || _isSkippable(v)) continue;
+      const c = _clone(v, seen);
+      if (c !== undefined) out[k] = c;
+    }
+    return out;
+  }
+
+  try {
+    const snap = _clone(card);
+    if (!snap) return null;
+
+    // Optional extra trimming if your model includes heavy runtime flags
+    delete snap._dirty;
+    delete snap._lastDraw;
+
+    // If your frames/masks have leftover `image` fields as plain objects, strip them:
+    if (Array.isArray(snap.frames)) {
+      for (const f of snap.frames) {
+        if (!f) continue;
+        if ('image' in f) delete f.image;
+        if (Array.isArray(f.masks)) {
+          for (const m of f.masks || []) {
+            if (m && 'image' in m) delete m.image;
+          }
+        }
+      }
+    }
+
+    return snap;
+  } catch (e) {
+    console.warn('Snapshot clone failed:', e);
+    return null;
+  }
+}
+
+// ---- Build the metadata object containing exactly ONE item ----
+function _buildEmbeddedMeta() {
+  const snapshot = _snapshotCurrentCard();
+  const keyName = (typeof getCardName === 'function' ? getCardName() : 'card');
+
+  return {
+    app: 'Card Conjurer',
+    exportedAt: new Date().toISOString(),
+    allSavedCards: snapshot ? [{ key: keyName, data: snapshot }] : [],
+    mode: 'snapshot'
+  };
+}
+
+// ---- Exporter: PNG + iTXt("cardKeys") with the single snapshot ----
+async function downloadCardWithMeta() {
+  // Optional: keep your artist-credit rule
+  try {
+    if (
+      card?.infoArtist?.replace(/ /g, '') == '' &&
+      !card?.artSource?.includes('/img/blank.png') &&
+      !card?.artZoom == 0
+    ) {
+      notify?.('You must credit an artist before downloading!', 5);
+      return;
+    }
+  } catch (_) {}
+
+  // Ensure latest render
+  try { typeof drawCard === 'function' && drawCard(); } catch {}
+
+  const baseName = (typeof getCardName === 'function' ? getCardName() : 'card');
+
+  // Canvas → PNG blob (ensure images were loaded CORS-safe)
+  const pngBlob = await new Promise(res => cardCanvas.toBlob(res, 'image/png'));
+  if (!pngBlob) { alert('Canvas export failed (possibly CORS-tainted).'); return; }
+
+  const pngU8 = new Uint8Array(await pngBlob.arrayBuffer());
+
+  const meta = _buildEmbeddedMeta();
+  if (!meta.allSavedCards.length) {
+    console.warn('No current card snapshot available; exporting plain PNG.');
+    const urlPlain = URL.createObjectURL(pngBlob);
+    const aPlain = document.createElement('a');
+    aPlain.download = baseName + '.png';
+    aPlain.href = urlPlain;
+    document.body.appendChild(aPlain); aPlain.click(); aPlain.remove();
+    setTimeout(() => URL.revokeObjectURL(urlPlain), 0);
+    return;
+  }
+
+  // Inject iTXt chunk and download
+  const itxt = _makeITXt('cardKeys', JSON.stringify(meta));
+  const withMeta = _insertBeforeIEND(pngU8, itxt);
+  const outBlob = new Blob([withMeta], { type: 'image/png' });
+
+  const url = URL.createObjectURL(outBlob);
+  const a = document.createElement('a');
+  a.download = baseName + '.png';
+  a.href = url;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+
+  notify?.('PNG exported with 1 embedded item (current card snapshot).', 3);
+}
+
+// ---- Route your existing downloadCard() to use the snapshot PNG path for PNGs ----
+(function routeDownloadCardToSnapshot() {
+  const _orig = (typeof downloadCard === 'function') ? downloadCard : null;
+  if (!_orig || downloadCard.__patchedToSnapshot) return;
+
+  downloadCard = function(alt = false, jpeg = false) {
+    if (jpeg) {
+      // JPEG cannot carry PNG chunks; keep original behavior for JPEG
+      return _orig(alt, true);
+    }
+    // For PNG, use the snapshot-embedding exporter
+    return downloadCardWithMeta();
+  };
+  downloadCard.__patchedToSnapshot = true;
+})();
+
+// --- Helper: read iTXt "cardKeys" from a PNG (uncompressed) ---
+async function _extractCardMetaFromPNG(fileOrUint8) {
+  const u8 = fileOrUint8 instanceof Uint8Array
+    ? fileOrUint8
+    : new Uint8Array(await fileOrUint8.arrayBuffer());
+
+  // Verify PNG signature
+  const SIG = [137,80,78,71,13,10,26,10];
+  for (let i = 0; i < 8; i++) if (u8[i] !== SIG[i]) throw new Error('Not a PNG');
+
+  // Walk chunks
+  let p = 8;
+  while (p < u8.length) {
+    const len = new DataView(u8.buffer, u8.byteOffset + p).getUint32(0);
+    const type = new TextDecoder('latin1').decode(u8.subarray(p + 4, p + 8));
+    const dataStart = p + 8;
+    const dataEnd = dataStart + len;
+
+    if (type === 'iTXt') {
+      // iTXt layout: keyword\0, compFlag(1), compMethod(1), lang\0, translated\0, text(UTF-8 or zlib)
+      let q = dataStart;
+      const readToNul = () => {
+        const start = q;
+        while (q < dataEnd && u8[q] !== 0) q++;
+        const out = u8.subarray(start, q);
+        q++; // skip NUL
+        return out;
+      };
+      const keyword = new TextDecoder('latin1').decode(readToNul());
+      const compFlag = u8[q++];         // 0 or 1
+      const compMethod = u8[q++];       // expect 0
+      readToNul();                       // language tag (ignored)
+      readToNul();                       // translated keyword (ignored)
+      const textBytes = u8.subarray(q, dataEnd);
+
+      if (keyword === 'cardKeys') {
+        if (compFlag === 1) throw new Error('Compressed iTXt not supported');
+        const text = new TextDecoder().decode(textBytes);
+        return JSON.parse(text); // should contain { allSavedCards: [...] } for your current exporter
+      }
+    }
+
+    p = dataEnd + 4; // skip CRC
+  }
+
+  throw new Error('No cardKeys iTXt chunk found in PNG');
+}
+
+// --- Drop-in replacement for your uploadSavedCards handler ---
+async function uploadSavedCards(event) {
+  const file = event.target.files && event.target.files[0];
+  if (!file) return;
+
+  try {
+    const isPNG = (file.type === 'image/png') || /\.png$/i.test(file.name || '');
+
+    if (isPNG) {
+      // --- PNG path: read embedded JSON from iTXt("cardKeys") ---
+      const meta = await _extractCardMetaFromPNG(file); // <— meta ONLY lives in this block
+
+      // Preferred schema from exporter: { allSavedCards: [ { key, data } ] }
+      if (Array.isArray(meta?.allSavedCards) && meta.allSavedCards.length) {
+        const first = meta.allSavedCards[0];      // you embed only the current card
+        await loadCardFromSnapshot(first.data);   // hydrate into UI/state
+        try { typeof saveCard === 'function' && saveCard(first); } catch {}
+        notify?.('Card loaded from PNG snapshot.', 3);
+        return;
+      }
+
+      // Fallback A: direct array of {key,data}
+      if (Array.isArray(meta) && meta.length && meta[0] && typeof meta[0] === 'object' && 'key' in meta[0] && 'data' in meta[0]) {
+        meta.forEach(item => saveCard(item));
+        notify?.(`Loaded ${meta.length} saved card(s) from PNG metadata (array).`, 3);
+        return;
+      }
+
+      // Fallback B: keys-only array → best-effort reconstruct from localStorage
+      if (Array.isArray(meta)) {
+        const items = meta
+          .map(key => ({ key, data: JSON.parse(localStorage.getItem(key)) }))
+          .filter(x => x && x.data);
+        if (items.length) {
+          items.forEach(item => saveCard(item));
+          notify?.(`Loaded ${items.length} saved card(s) from PNG metadata (keys-only).`, 3);
+        } else {
+          notify?.('No saved cards found in PNG metadata (keys-only).', 4);
+        }
+        return;
+      }
+
+      notify?.('PNG metadata present but no loadable items.', 4);
+      return;
+    }
+
+    // --- Legacy JSON file path (NO "meta" below this line) ---
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = JSON.parse(reader.result);
+        const items = Array.isArray(parsed) ? parsed : parsed?.allSavedCards;
+        if (!Array.isArray(items) || !items.length) {
+          notify?.('No saved cards found in JSON file.', 4);
+          return;
+        }
+        items.forEach(item => saveCard(item));
+        notify?.(`Loaded ${items.length} saved card(s) from JSON file.`, 3);
+      } catch (e) {
+        console.error(e);
+        notify?.('Invalid JSON in uploaded file.', 5);
+      }
+    };
+    reader.readAsText(file);
+
+  } catch (err) {
+    console.error(err);
+    notify?.(`Failed to import: ${err.message}`, 5);
+  } finally {
+    if (event && event.target) event.target.value = '';
+  }
+}
+
+function _withDefaults(obj, defaults) {
+  const out = { ...defaults, ...(obj || {}) };
+  return out;
+}
+
+// Load an image with CORS friendly settings and return a Promise<HTMLImageElement>
+function _loadImage(src) {
+  return new Promise((resolve, reject) => {
+    if (!src) return resolve(null);
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => resolve(img);
+    img.onerror = (e) => reject(new Error('Image failed to load: ' + src));
+    img.src = src;
+  });
+}
+
+function _upgradeSnapshotToCard(snapshot) {
+  if (!snapshot || typeof snapshot !== 'object') return null;
+
+  // Top-level defaults (tweak to your app)
+  const CARD_DEFAULTS = {
+    version: snapshot.version || '3',
+    artSource: snapshot.artSource || '/img/blank.png',
+    artZoom: snapshot.artZoom ?? 0,
+    infoArtist: snapshot.infoArtist ?? '',
+    bottomInfo: snapshot.bottomInfo || {},
+    // add other stable fields you rely on
+  };
+
+  const card = _withDefaults(snapshot, CARD_DEFAULTS);
+
+  // Ensure arrays exist
+  card.frames = Array.isArray(snapshot.frames) ? snapshot.frames : [];
+  card.mana = Array.isArray(snapshot.mana) ? snapshot.mana : card.mana || [];
+
+  // Normalize each frame/mask entry (strip leftover transient image objects)
+  card.frames = card.frames.map((f) => {
+    const nf = { ...f };
+    if ('image' in nf) delete nf.image;
+    if (Array.isArray(nf.masks)) {
+      nf.masks = nf.masks.map((m) => {
+        const nm = { ...m };
+        if ('image' in nm) delete nm.image;
+        return nm;
+      });
+    }
+    return nf;
+  });
+
+  return card;
+}
+
+async function _rehydrateImagesForCard(cardObj) {
+  // Art
+  try {
+    cardObj._artImage = await _loadImage(cardObj.artSource);
+  } catch (e) {
+    console.warn(e.message);
+    cardObj._artImage = null;
+  }
+
+  // Frames and masks (if your renderer expects image objects there)
+  for (const f of cardObj.frames) {
+    if (f && f.src) {
+      try { f._image = await _loadImage(f.src); } catch (e) { console.warn(e.message); f._image = null; }
+    }
+    if (Array.isArray(f?.masks)) {
+      for (const m of f.masks) {
+        if (m && m.src) {
+          try { m._image = await _loadImage(m.src); } catch (e) { console.warn(e.message); m._image = null; }
+        }
+      }
+    }
+  }
+}
+
+async function loadCardFromSnapshot(snapshot) {
+  const upgraded = _upgradeSnapshotToCard(snapshot);
+  if (!upgraded) {
+    notify?.('Import failed: invalid card snapshot.', 5);
+    return;
+  }
+
+  // Swap global card
+  window.card = upgraded;
+
+  // Wait for fonts so text widths/kerning are stable on first draw
+  try {
+    if (document?.fonts?.ready) await document.fonts.ready;
+  } catch {}
+
+  // Recreate images referenced by URLs
+  await _rehydrateImagesForCard(card);
+
+  // Re-apply UI-driven styles / derived sections (adjust to your app)
+  try { typeof setBottomInfoStyle === 'function' && setBottomInfoStyle(); } catch {}
+  try { typeof bottomInfoEdited === 'function' && bottomInfoEdited(); } catch {}
+
+  // Final render
+  try { typeof drawCard === 'function' && drawCard(); } catch (e) {
+    console.error('drawCard failed:', e);
+    notify?.('Imported, but draw failed (see console).', 5);
+  }
+
+  notify?.('Card loaded from PNG snapshot.', 3);
+}

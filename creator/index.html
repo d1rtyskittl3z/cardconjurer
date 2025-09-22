@@ -703,7 +703,9 @@
 							<h5 class='padding margin-bottom input-description'>Download all saved cards</h5>
 							<button class='input margin-bottom' onclick='downloadSavedCards();'>Download All</button>
 							<h5 class='padding margin-bottom input-description'>Upload previously downloaded file of saved cards (downloaded from above)</h5>
-							<input type='file' accept='.cardconjurer,.txt' class='input margin-bottom' oninput='uploadSavedCards(event);'>
+							<!-- Line altered to accept new card format with Metadata --D1rtySkittl3z -->
+							<input type='file' accept='.png,.json,.cardconjurer,.txt' class='input margin-bottom' onchange='uploadSavedCards(event);'> 
+							<!-- <input type='file' accept='.cardconjurer,.txt' class='input margin-bottom' oninput='uploadSavedCards(event);'> -->
 							<h5 class='padding margin-bottom input-description'>Delete ALL saved cards</h5>
 							<button class='input margin-bottom' onclick='deleteSavedCards();'>Delete All</button>
 						</div>
